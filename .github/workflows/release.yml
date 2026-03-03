@@ -29,19 +29,22 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Prepare Laravel writable dirs (before composer)
+        run: |
+            mkdir -p bootstrap/cache
+            mkdir -p storage/framework/cache
+            mkdir -p storage/framework/sessions
+            mkdir -p storage/framework/views
+            mkdir -p storage/logs
+            chmod -R 0777 storage bootstrap/cache
+
       - name: Composer install (prod)
-        run: composer install --no-dev --prefer-dist --no-interaction --no-progress --optimize-autoloader
+        run: composer install --no-dev --prefer-dist --no-interaction --no-progress --optimize-autoloader --no-scripts
 
       - name: Build assets (Vite)
         run: |
           npm ci
           npm run build
-
-      - name: Prepare runtime dirs
-        run: |
-          mkdir -p bootstrap/cache
-          mkdir -p storage/framework/{cache,sessions,views}
-          mkdir -p storage/logs
 
       - name: Create release.zip
         run: |
