@@ -2,10 +2,12 @@
 
 namespace App\Http\Controllers;
 
+use App\Enums\OrderStatus;
+use App\Enums\PaymentMethod;
 use App\Models\Order;
 use App\Models\OrderItem;
-use App\Models\Product;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
 use MercadoPago\Client\Preference\PreferenceClient;
 use MercadoPago\MercadoPagoConfig;
 
@@ -14,64 +16,83 @@ class CheckoutController extends Controller
     public function start(Request $request)
     {
         $cart = session('cart', []);
-        if (empty($cart))
-            return back()->with('error', 'Tu carrito está vacío.');
-
-        $data = $request->validate([
-            'name' => ['required', 'string', 'max:80'],
-            'phone' => ['required', 'string', 'max:30'],
-            'email' => ['nullable', 'email', 'max:120'],
-            'delivery' => ['required', 'in:pickup,shipping'],
-            'address' => ['nullable', 'string', 'max:255'],
-            'notes' => ['nullable', 'string', 'max:300'],
-        ]);
-
-        // Total + items snapshot
-        $total = 0;
-
-        $order = Order::create([
-            'status' => 'pending',
-            'total_cents' => 0,
-            ...$data,
-        ]);
-
-        foreach ($cart as $productId => $row) {
-            $product = Product::whereKey($productId)->where('is_active', true)->firstOrFail();
-            $qty = max(1, (int) ($row['qty'] ?? 1));
-
-            $total += $product->price_cents * $qty;
-
-            OrderItem::create([
-                'order_id' => $order->id,
-                'product_id' => $product->id,
-                'name_snapshot' => $product->name,
-                'price_cents_snapshot' => $product->price_cents,
-                'qty' => $qty,
-            ]);
+        if (empty($cart)) {
+            return redirect()->route('checkout')->with('error', 'Tu carrito está vacío.');
         }
 
-        $order->update(['total_cents' => $total]);
+        $data = $request->validate([
+            'name' => ['required', 'string', 'max:120'],
+            'phone' => ['required', 'string', 'max:30'],
+            'email' => ['nullable', 'email', 'max:120'],
 
-        // Guardamos id de orden para el siguiente paso
-        session()->put('checkout_order_id', $order->id);
+            'delivery' => ['required', 'in:pickup,shipping'],
+            'address' => ['nullable', 'string', 'max:255'],
+            'notes' => ['nullable', 'string', 'max:500'],
 
-        return redirect()->route('checkout.mp');
-    }
+            'payment_method' => ['required', 'in:mp,transfer'],
+        ]);
 
-    public function mercadoPago()
-    {
-        $orderId = session('checkout_order_id');
-        abort_if(!$orderId, 404);
+        if ($data['delivery'] === 'shipping' && blank($data['address'])) {
+            return back()->withErrors(['address' => 'La dirección es requerida para envío.'])->withInput();
+        }
 
-        $order = Order::with('items')->findOrFail($orderId);
+        $order = DB::transaction(function () use ($data, $cart) {
+            $order = Order::create([
+                'status' => $data['payment_method'] === 'mp'
+                    ? OrderStatus::PendingPayment
+                    : OrderStatus::PendingTransfer,
 
+                'payment_method' => $data['payment_method'] === 'mp'
+                    ? PaymentMethod::MercadoPago
+                    : PaymentMethod::Transfer,
+
+                'total_cents' => 0,
+
+                'name' => $data['name'],
+                'phone' => $data['phone'],
+                'email' => $data['email'] ?? null,
+
+                'delivery' => $data['delivery'],
+                'address' => $data['address'] ?? null,
+                'notes' => $data['notes'] ?? null,
+            ]);
+
+            foreach ($cart as $productId => $item) {
+                $qty = (int) ($item['qty'] ?? 1);
+                $priceCents = (int) ($item['price_cents'] ?? 0);
+                $name = (string) ($item['name'] ?? 'Producto');
+
+                OrderItem::create([
+                    'order_id' => $order->id,
+                    'product_id' => (int) $productId,
+                    'name_snapshot' => $name,
+                    'price_cents_snapshot' => $priceCents,
+                    'qty' => max(1, $qty),
+                ]);
+            }
+
+            $order->recalcTotal();
+
+            session(['last_order_id' => $order->id]);
+
+            return $order;
+        });
+
+        // MVP: orden ya creada, vaciamos carrito
+        session()->forget('cart');
+
+        if ($order->payment_method === PaymentMethod::Transfer) {
+            return redirect()->route('transfer.instructions', $order);
+        }
+
+        // Mercado Pago
         MercadoPagoConfig::setAccessToken(config('services.mercadopago.access_token'));
 
-        $items = $order->items->map(function ($it) {
+        $items = $order->items->map(function ($i) {
             return [
-                'title' => $it->name_snapshot,
-                'quantity' => (int) $it->qty,
-                'unit_price' => (float) ($it->price_cents_snapshot / 100),
+                'title' => $i->name_snapshot,
+                'quantity' => $i->qty,
+                'unit_price' => round($i->price_cents_snapshot / 100, 2),
                 'currency_id' => 'MXN',
             ];
         })->values()->all();
@@ -81,31 +102,35 @@ class CheckoutController extends Controller
         $preference = $client->create([
             'items' => $items,
             'external_reference' => (string) $order->id,
+            'statement_descriptor' => 'TODO ARTESANAL',
             'back_urls' => [
-                'success' => route('checkout.success', ['order' => $order->id]),
-                'failure' => route('checkout.failure', ['order' => $order->id]),
-                'pending' => route('checkout.pending', ['order' => $order->id]),
+                'success' => route('checkout.success', $order),
+                'failure' => route('checkout.failure', $order),
+                'pending' => route('checkout.pending', $order),
             ],
             'auto_return' => 'approved',
-            'notification_url' => route('mp.webhook'),
+            'notification_url' => route('mp.webhook') . '?source_news=webhooks',
         ]);
 
-        $order->update(['mp_preference_id' => $preference->id ?? null]);
+        $order->update([
+            'mp_preference_id' => $preference->id ?? null,
+        ]);
 
-        // Redirige a MercadoPago
         return redirect()->away($preference->init_point);
     }
 
-    public function success(Request $request)
+    public function success(Order $order)
     {
-        return view('checkout-success');
+        return view('checkout.success', compact('order'));
     }
-    public function failure(Request $request)
+
+    public function failure(Order $order)
     {
-        return view('checkout-failure');
+        return view('checkout.failure', compact('order'));
     }
-    public function pending(Request $request)
+
+    public function pending(Order $order)
     {
-        return view('checkout-pending');
+        return view('checkout.pending', compact('order'));
     }
 }

@@ -1,0 +1,3 @@
+protected $except = [
+    'webhooks/mercadopago',
+];
