@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
 
 class OrderItem extends Model
 {
@@ -14,7 +15,13 @@ class OrderItem extends Model
         'qty',
     ];
 
-    public function order()
+    protected $casts = [
+        'product_id' => 'integer',
+        'price_cents_snapshot' => 'integer',
+        'qty' => 'integer',
+    ];
+
+    public function order(): BelongsTo
     {
         return $this->belongsTo(Order::class);
     }
